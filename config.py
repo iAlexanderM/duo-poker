@@ -2,14 +2,13 @@ RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
 SUITS = ['h', 'd', 'c', 's']
 SUIT_SYMBOLS = {'h': '♥', 'd': '♦', 'c': '♣', 's': '♠'}
 
-ALL_POSITIONS = ['UTG', 'UTG+1', 'UTG+2', 'MP', 'MP+1', 'CO', 'BTN', 'SB', 'BB']
+ALL_POSITIONS = ['UTG', 'UTG+1', 'LJ', 'HJ', 'CO', 'BTN', 'SB', 'BB']
 
 POSITION_COORDS = {
     'UTG': (350, 50),
     'UTG+1': (497, 91),
-    'UTG+2': (576, 195),
-    'MP': (549, 312),
-    'MP+1': (428, 389),
+    'LJ': (549, 312),
+    'HJ': (428, 389),
     'CO': (272, 389),
     'BTN': (151, 312),
     'SB': (124, 195),
@@ -27,22 +26,16 @@ PREFLOP_CHARTS = {
         'suited': ['AKs', 'AQs', 'AJs', 'ATs', 'KQs', 'KJs', 'QJs'],
         'offsuit': ['AKo', 'AQo', 'AJo']
     },
-    'UTG+2': {
+    'LJ': {
         'pairs': ['AA', 'KK', 'QQ', 'JJ', 'TT', '99', '88'],
         'suited': ['AKs', 'AQs', 'AJs', 'ATs', 'A9s', 'KQs', 'KJs', 'KTs', 'QJs', 'QTs', 'JTs'],
         'offsuit': ['AKo', 'AQo', 'AJo', 'ATo', 'KQo']
     },
-    'MP': {
+    'HJ': {
         'pairs': ['AA', 'KK', 'QQ', 'JJ', 'TT', '99', '88', '77'],
         'suited': ['AKs', 'AQs', 'AJs', 'ATs', 'A9s', 'A8s', 'KQs', 'KJs', 'KTs', 'K9s', 'QJs', 'QTs', 'Q9s', 'JTs',
                    'J9s', 'T9s'],
         'offsuit': ['AKo', 'AQo', 'AJo', 'ATo', 'A9o', 'KQo', 'KJo', 'QJo']
-    },
-    'MP+1': {
-        'pairs': ['AA', 'KK', 'QQ', 'JJ', 'TT', '99', '88', '77', '66'],
-        'suited': ['AKs', 'AQs', 'AJs', 'ATs', 'A9s', 'A8s', 'A7s', 'KQs', 'KJs', 'KTs', 'K9s', 'K8s', 'QJs', 'QTs',
-                   'Q9s', 'Q8s', 'JTs', 'J9s', 'J8s', 'T9s', 'T8s', '98s'],
-        'offsuit': ['AKo', 'AQo', 'AJo', 'ATo', 'A9o', 'A8o', 'KQo', 'KJo', 'KTo', 'QJo', 'QTo', 'JTo']
     },
     'CO': {
         'pairs': ['AA', 'KK', 'QQ', 'JJ', 'TT', '99', '88', '77', '66', '55'],

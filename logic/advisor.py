@@ -2,11 +2,11 @@ from logic.evaluator import get_preflop_category, get_postflop_equity
 
 
 def recommend_action(hand, position, stack, opponent_action=None, bet_to_call=None, num_players=6, board=None,
-                     stage='preflop'):
+                     stage='preflop', pot_size_bb=None):
     if stage == 'preflop':
         return _preflop_advice(hand, position, stack, opponent_action, bet_to_call, num_players)
     else:
-        return _postflop_advice(hand, position, stack, opponent_action, bet_to_call, board)
+        return _postflop_advice(hand, position, stack, opponent_action, bet_to_call, board, pot_size_bb)
 
 
 def _preflop_advice(hand, position, stack, opponent_action, bet_to_call, num_players):
@@ -40,7 +40,7 @@ def _preflop_advice(hand, position, stack, opponent_action, bet_to_call, num_pla
     return "Неизвестное действие"
 
 
-def _postflop_advice(hand, position, stack, opponent_action, bet_to_call, board):
+def _postflop_advice(hand, position, stack, opponent_action, bet_to_call, board, pot_size_bb=None):
     equity = get_postflop_equity(hand, board)
     stack_bb = stack
 
@@ -58,7 +58,17 @@ def _postflop_advice(hand, position, stack, opponent_action, bet_to_call, board)
     if opponent_action in ('bet', 'raise', 'allin'):
         if bet_to_call is None:
             bet_to_call = 0
-        pot_odds = bet_to_call / (2 * bet_to_call) if bet_to_call > 0 else 0
+        # Пот-оддсы: сколько надо поставить до колла относительно банка “после колла”.
+        # bet_to_call / (pot + bet_to_call)
+        if bet_to_call <= 0:
+            pot_odds = 0
+        else:
+            if pot_size_bb is None or pot_size_bb < 0:
+                # Фолбэк к старой логике (по сути давала 0.5 при bet_to_call > 0)
+                pot_odds = bet_to_call / (2 * bet_to_call)
+            else:
+                denom = pot_size_bb + bet_to_call
+                pot_odds = (bet_to_call / denom) if denom > 0 else 0
         if equity > pot_odds + 0.1:
             return "Колл"
         else:
