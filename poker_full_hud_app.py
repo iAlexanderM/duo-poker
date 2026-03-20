@@ -14,8 +14,40 @@ PREFLOP_ORDER = ["UTG", "UTG+1", "LJ", "HJ", "CO", "BTN", "SB", "BB"]
 POSTFLOP_ORDER = ["SB", "BB", "UTG", "UTG+1", "LJ", "HJ", "CO", "BTN"]
 
 
-class PokerFullHUDApp:
+def _postflop_acting_order(positions: list[str]) -> list[str]:
+    """Порядок ходов на постфлопе; в HU первым ходит BB, затем SB."""
+    if len(positions) == 2 and set(positions) == {"SB", "BB"}:
+        return ["BB", "SB"]
+    return POSTFLOP_ORDER
 
+
+def _street_order(stage: str, positions: list[str]) -> list[str]:
+    full = PREFLOP_ORDER if stage == "preflop" else _postflop_acting_order(positions)
+    return [p for p in full if p in positions]
+
+
+def _button_centric_order(n: int) -> list[str]:
+    """
+    Порядок мест по часовой стрелке от баттона (баттон первый).
+    При сдвиге баттона на одно место по столу твоя позиция в списке
+    смещается на один шаг «к баттону»: BB→SB, SB→BTN, BTN→CO, …, UTG→BB.
+    """
+    if n == 2:
+        return ["SB", "BB"]
+    if n == 3:
+        return ["BTN", "SB", "BB"]
+    if n == 4:
+        return ["CO", "BTN", "SB", "BB"]
+    if n == 5:
+        return ["UTG", "CO", "BTN", "SB", "BB"]
+    if n == 6:
+        return ["UTG", "HJ", "CO", "BTN", "SB", "BB"]
+    if n == 7:
+        return ["UTG", "LJ", "HJ", "CO", "BTN", "SB", "BB"]
+    return ["BTN", "SB", "BB", "UTG", "UTG+1", "LJ", "HJ", "CO"]
+
+
+class PokerFullHUDApp:
     WIDTH = 1280
     HEIGHT = 960
 
@@ -64,6 +96,7 @@ class PokerFullHUDApp:
         self.deck_btns: dict[str, tk.Button] = {}
         self.slot_rects: dict[tuple, tuple] = {}
         self.raise_var = tk.StringVar(value="2.5")
+        self._action_undo_stack: list[dict] = []
 
         self.root.grid_rowconfigure(0, weight=1)
         self.root.grid_rowconfigure(1, weight=0)
@@ -202,6 +235,7 @@ class PokerFullHUDApp:
             return
 
         self._saved_nplayers = n
+        self._action_undo_stack.clear()
 
         if self._stack_overrides:
             self.stacks = {}
@@ -315,10 +349,35 @@ class PokerFullHUDApp:
     # ══════════════════════════════════════════════════════════════
 
     def _begin_action_round(self):
-        order = PREFLOP_ORDER if self.stage == "preflop" else POSTFLOP_ORDER
+        self._action_undo_stack.clear()
+        # Префлоп: UTG → … → BB (первый после блайндов). Постфлоп: с SB (в HU: BB → SB).
+        # После рейза очередь пересобирается от следующего за рейзером по кругу (_reopen).
+        order = _street_order(self.stage, self.positions)
         self.action_queue = deque(
             p for p in order if p in self.active and p not in self.folded)
         self._next_actor()
+
+    def _active_clockwise_after(self, after_pos: str) -> deque[str]:
+        """Активные игроки по часовой, начиная со следующего места после рейза/олл-ина."""
+        ring = _street_order(self.stage, self.positions)
+        if not ring or after_pos not in ring:
+            full = (
+                PREFLOP_ORDER
+                if self.stage == "preflop"
+                else _postflop_acting_order(self.positions)
+            )
+            return deque(
+                p for p in full
+                if p in self.active and p != after_pos and p not in self.folded
+            )
+        n = len(ring)
+        start = (ring.index(after_pos) + 1) % n
+        out: list[str] = []
+        for step in range(n - 1):
+            pos = ring[(start + step) % n]
+            if pos in self.active and pos not in self.folded:
+                out.append(pos)
+        return deque(out)
 
     def _next_actor(self):
         while self.action_queue and self.action_queue[0] in self.folded:
@@ -350,14 +409,14 @@ class PokerFullHUDApp:
                      font=("Arial", 9, "bold")).pack(side="left", padx=(4, 1))
             v = tk.StringVar(value=f"{self.stacks.get(pos, 0):.1f}")
             self._live_stacks[pos] = v
-            tk.Entry(bar, textvariable=v, width=5, bg="#302828", fg=self.TEXT,
+            tk.Entry(bar, textvariable=v, width=7, bg="#302828", fg=self.TEXT,
                      insertbackground=self.TEXT, relief="flat",
                      font=("Arial", 9, "bold")).pack(side="left", padx=(0, 3))
 
         tk.Label(bar, text="Банк:", bg="#1e1a1a", fg=self.MUTED,
                  font=("Arial", 9, "bold")).pack(side="left", padx=(8, 2))
         self._live_pot = tk.StringVar(value=f"{self.pot:.1f}")
-        tk.Entry(bar, textvariable=self._live_pot, width=6, bg="#302828",
+        tk.Entry(bar, textvariable=self._live_pot, width=10, bg="#302828",
                  fg=self.TEXT, insertbackground=self.TEXT, relief="flat",
                  font=("Arial", 9, "bold")).pack(side="left")
 
@@ -376,9 +435,56 @@ class PokerFullHUDApp:
 
     # ── opponent turn ────────────────────────────────────────────
 
+    def _wizard_undo_bar(self):
+        top = tk.Frame(self.wizard, bg=self.PANEL)
+        top.pack(fill="x", padx=8, pady=(4, 2))
+        tk.Button(
+            top, text="← Назад", command=self._undo_action,
+            state="normal" if self._action_undo_stack else "disabled",
+            bg="#45515d", fg="white", relief="flat",
+            font=("Arial", 11, "bold"), padx=12, pady=4,
+        ).pack(side="right")
+
+    def _snapshot_action_state(self) -> dict:
+        return {
+            "stacks": dict(self.stacks),
+            "bets": dict(self.bets),
+            "pot": self.pot,
+            "max_bet": self.max_bet,
+            "active": set(self.active),
+            "folded": set(self.folded),
+            "action_queue": deque(self.action_queue),
+        }
+
+    def _push_action_undo(self):
+        if len(self._action_undo_stack) >= 200:
+            self._action_undo_stack.pop(0)
+        self._action_undo_stack.append(self._snapshot_action_state())
+
+    def _undo_action(self):
+        if not self._action_undo_stack:
+            return
+        s = self._action_undo_stack.pop()
+        self.stacks = dict(s["stacks"])
+        self.bets = dict(s["bets"])
+        self.pot = s["pot"]
+        self.max_bet = s["max_bet"]
+        self.active = set(s["active"])
+        self.folded = set(s["folded"])
+        self.action_queue = deque(s["action_queue"])
+        self.current_actor = self.action_queue[0] if self.action_queue else None
+        if not self.action_queue:
+            self._next_actor()
+            return
+        if self.current_actor == self.my_pos:
+            self._show_my_turn()
+        else:
+            self._show_opp_turn(self.current_actor)
+
     def _show_opp_turn(self, pos: str):
         self._clear_wizard()
         self._draw_table()
+        self._wizard_undo_bar()
 
         to_call = max(0.0, self.max_bet - self.bets.get(pos, 0))
 
@@ -404,6 +510,7 @@ class PokerFullHUDApp:
     def _show_my_turn(self):
         self._clear_wizard()
         self._draw_table()
+        self._wizard_undo_bar()
 
         to_call = max(0.0, self.max_bet - self.bets.get(self.my_pos, 0))
 
@@ -527,16 +634,16 @@ class PokerFullHUDApp:
             if not self._slider_updating:
                 self.raise_var.set(f"{float(val):.1f}")
 
-        slider_from = max(min_raise, 0.1)
-        slider_to = max(max_raise, slider_from + 0.1)
-
+        slider_from = float(max(min_raise, 0.1))
+        slider_to = float(max(max_raise, slider_from + 0.1))
+        # Tk.Scale на части сборок плохо масштабирует большой диапазон при малой длине — даём запас по длине.
         self._raise_slider = tk.Scale(
             row2, from_=slider_from, to=slider_to,
             orient="horizontal", resolution=0.5,
             command=on_slider,
             bg=self.PANEL, fg=self.TEXT, troughcolor="#302828",
             highlightthickness=0, sliderrelief="flat",
-            font=("Arial", 9), showvalue=False, length=280,
+            font=("Arial", 9), showvalue=False, length=380,
         )
         self._raise_slider.set(float(self.raise_var.get()))
         self._raise_slider.pack(side="left", padx=(8, 0), fill="x", expand=True)
@@ -545,6 +652,7 @@ class PokerFullHUDApp:
 
     def _do(self, pos: str, action: str):
         self._sync_live_stacks()
+        self._push_action_undo()
         self.action_queue.popleft()
         already = self.bets.get(pos, 0.0)
 
@@ -586,12 +694,7 @@ class PokerFullHUDApp:
         self._next_actor()
 
     def _reopen(self, raiser: str):
-        order = PREFLOP_ORDER if self.stage == "preflop" else POSTFLOP_ORDER
-        remaining = deque(
-            p for p in order
-            if p in self.active and p != raiser and p not in self.folded
-        )
-        self.action_queue = remaining
+        self.action_queue = self._active_clockwise_after(raiser)
 
     # ── street transition ────────────────────────────────────────
 
@@ -642,50 +745,158 @@ class PokerFullHUDApp:
         names = {"flop": "Флоп", "turn": "Терн", "river": "Ривер"}
         self._show_cards(f"Введите карты {names[stage]}", self._cards_done_post)
 
-    def _hand_over(self, winner: str | None = None):
+    def _split_pot_among(self, winners: list[str]) -> tuple[float, float]:
+        """Делит self.pot поровну между winners. Возвращает (банк до сплита, доля одного)."""
+        pot_val = float(self.pot)
+        n = len(winners)
+        if n <= 0:
+            return pot_val, 0.0
+        per = pot_val / n
+        for w in winners:
+            self.stacks[w] = self.stacks.get(w, 0) + per
+        dust = pot_val - per * n
+        if abs(dust) > 1e-9:
+            self.stacks[winners[0]] = self.stacks.get(winners[0], 0) + dust
+        self.pot = 0.0
+        return pot_val, per
+
+    def _show_showdown_winner_picker(self):
+        self._clear_wizard()
+        self._draw_table()
+
+        f = tk.Frame(self.wizard, bg=self.PANEL)
+        f.pack(fill="x", pady=(16, 8))
+
+        tk.Label(
+            f, text=f"Шоудаун  |  Банк: {self.pot:.1f} bb",
+            bg=self.PANEL, fg=self.TEXT, font=("Arial", 18, "bold"),
+        ).pack(pady=(0, 6))
+        tk.Label(
+            f, text="Ничья: отметь всех победителей, банк поделится поровну",
+            bg=self.PANEL, fg=self.MUTED, font=("Arial", 12),
+        ).pack(pady=(0, 12))
+
+        self._showdown_pick_vars = {}
+        order_i = {p: i for i, p in enumerate(PREFLOP_ORDER)}
+        for pos in sorted(self.active, key=lambda p: order_i.get(p, 99)):
+            v = tk.IntVar(value=0)
+            self._showdown_pick_vars[pos] = v
+            tk.Checkbutton(
+                f, text=pos, variable=v, onvalue=1, offvalue=0,
+                bg=self.PANEL, fg=self.TEXT, selectcolor="#302828",
+                activebackground=self.PANEL, activeforeground=self.TEXT,
+                font=("Arial", 14, "bold"),
+                anchor="w",
+            ).pack(fill="x", padx=24, pady=3)
+
+        bf = tk.Frame(self.wizard, bg=self.PANEL)
+        bf.pack(pady=(16, 14))
+        tk.Button(
+            bf, text="Продолжить",
+            command=self._confirm_showdown_winners,
+            bg="#2f6f3a", fg="white", relief="flat",
+            font=("Arial", 14, "bold"), padx=24, pady=6,
+        ).pack(side="left", padx=4)
+        tk.Button(
+            bf, text="« Назад",
+            command=self._hand_over,
+            bg="#45515d", fg="white", relief="flat",
+            font=("Arial", 12, "bold"), padx=14, pady=4,
+        ).pack(side="left", padx=4)
+
+    def _confirm_showdown_winners(self):
+        if not hasattr(self, "_showdown_pick_vars"):
+            self._hand_over()
+            return
+        chosen = [p for p, var in self._showdown_pick_vars.items() if var.get()]
+        if not chosen:
+            messagebox.showwarning("Шоудаун", "Выбери хотя бы одного победителя")
+            return
+        self._showdown_pick_vars = {}
+        self._hand_over(winners=chosen)
+
+    def _hand_over(self, winner: str | None = None, winners: list[str] | None = None):
+        self._action_undo_stack.clear()
         self.current_actor = None
 
-        if winner:
+        pot_before = float(self.pot)
+        distributed = False
+
+        if winners is not None and len(winners) >= 1:
+            pot_before, _ = self._split_pot_among(winners)
+            distributed = True
+        elif winner:
             self.stacks[winner] = self.stacks.get(winner, 0) + self.pot
-            self.pot = 0
+            self.pot = 0.0
+            distributed = True
         elif len(self.active) <= 1:
             w = next(iter(self.active), None)
             if w:
                 self.stacks[w] = self.stacks.get(w, 0) + self.pot
-                self.pot = 0
+                self.pot = 0.0
+            distributed = True
 
-        self._saved_stacks = dict(self.stacks)
-        self._first_hand = False
+        if distributed:
+            self._saved_stacks = dict(self.stacks)
+            self._first_hand = False
 
         self._clear_wizard()
         self._draw_table()
         f = tk.Frame(self.wizard, bg=self.PANEL)
         f.pack(fill="x", pady=(16, 6))
 
-        if winner:
-            tk.Label(f, text=f"Победил {winner}  |  Забрал банк {self.pot:.1f} → стек: {self.stacks[winner]:.1f} bb",
-                     bg=self.PANEL, fg=self.ACCENT, font=("Arial", 16, "bold")
-                     ).pack(pady=(0, 10))
+        if winners is not None and len(winners) >= 1:
+            names = ", ".join(winners)
+            n = len(winners)
+            share_txt = f"{pot_before / n:.1f}" if n else "0"
+            tk.Label(
+                f,
+                text=(f"Победили: {names}  |  Банк {pot_before:.1f} bb поровну "
+                      f"(~{share_txt} bb каждому)"),
+                bg=self.PANEL, fg=self.ACCENT, font=("Arial", 16, "bold"),
+                wraplength=900, justify="center",
+            ).pack(pady=(0, 10))
+        elif winner:
+            tk.Label(
+                f,
+                text=(f"Победил {winner}  |  Забрал банк {pot_before:.1f} bb  "
+                      f"→ стек: {self.stacks[winner]:.1f} bb"),
+                bg=self.PANEL, fg=self.ACCENT, font=("Arial", 16, "bold")
+            ).pack(pady=(0, 10))
         elif len(self.active) <= 1:
             w = next(iter(self.active), "—")
             tk.Label(f, text=f"Все сфолдили — победил {w}  |  Банк забран",
                      bg=self.PANEL, fg=self.ACCENT, font=("Arial", 16, "bold")
                      ).pack(pady=(0, 10))
         else:
-            tk.Label(f, text=f"Шоудаун  |  Банк: {self.pot:.1f} bb  |  Кто выиграл?",
-                     bg=self.PANEL, fg=self.TEXT, font=("Arial", 18, "bold")
-                     ).pack(pady=(0, 10))
+            tk.Label(
+                f, text=f"Шоудаун  |  Банк: {self.pot:.1f} bb  |  Кто выиграл?",
+                bg=self.PANEL, fg=self.TEXT, font=("Arial", 18, "bold")
+            ).pack(pady=(0, 10))
             wf = tk.Frame(f, bg=self.PANEL)
-            wf.pack(pady=(0, 10))
-            for pos in sorted(self.active):
-                tk.Button(wf, text=pos, width=8,
-                          bg=self.ACCENT, fg="#111", relief="flat",
-                          font=("Arial", 13, "bold"),
-                          command=lambda p=pos: self._hand_over(winner=p)
-                          ).pack(side="left", padx=4)
-            tk.Label(f, text="(Нажми позицию победителя — банк уйдёт ему в стек)",
-                     bg=self.PANEL, fg=self.MUTED, font=("Arial", 11)
-                     ).pack(pady=(0, 6))
+            wf.pack(pady=(0, 8))
+            order_i = {p: i for i, p in enumerate(PREFLOP_ORDER)}
+            for pos in sorted(self.active, key=lambda p: order_i.get(p, 99)):
+                tk.Button(
+                    wf, text=pos, width=8,
+                    bg=self.ACCENT, fg="#111", relief="flat",
+                    font=("Arial", 13, "bold"),
+                    command=lambda p=pos: self._hand_over(winner=p),
+                ).pack(side="left", padx=4)
+            tk.Label(
+                f, text="Ничья / чоп:",
+                bg=self.PANEL, fg=self.MUTED, font=("Arial", 11, "bold")
+            ).pack(pady=(10, 4))
+            tk.Button(
+                f, text="Несколько победителей →",
+                command=self._show_showdown_winner_picker,
+                bg="#45515d", fg="white", relief="flat",
+                font=("Arial", 12, "bold"), padx=16, pady=5,
+            ).pack(pady=(0, 6))
+            tk.Label(
+                f, text="(Обычно — кнопка позиции; чоп — только при ничьей)",
+                bg=self.PANEL, fg=self.MUTED, font=("Arial", 10),
+            ).pack(pady=(0, 4))
 
         bf = tk.Frame(self.wizard, bg=self.PANEL)
         bf.pack(pady=(4, 14))
@@ -703,13 +914,15 @@ class PokerFullHUDApp:
                   ).pack(side="left", padx=4)
 
     def _continue_game(self):
+        self._action_undo_stack.clear()
         n = len(self.positions)
         old_seats = self._seat_order()
         seat_stacks = [self.stacks.get(pos, 0) for pos in old_seats]
 
-        pos_list = [p for p in TABLE_ORDER if p in self.positions]
-        idx = pos_list.index(self.my_pos)
-        self.my_pos = pos_list[(idx + 1) % len(pos_list)]
+        # Сдвиг баттона на 1 место по часовой: твоя позиция как в живой игре (BB→SB, SB→BTN, …).
+        bo = _button_centric_order(n)
+        if self.my_pos in bo:
+            self.my_pos = bo[(bo.index(self.my_pos) - 1) % n]
 
         self.positions = self._pos_for_n(n)
         new_seats = self._seat_order()
@@ -837,6 +1050,7 @@ class PokerFullHUDApp:
                   ).pack(side="left", padx=4)
 
     def _apply_mg_edit(self):
+        self._action_undo_stack.clear()
         for pos, var in self._mg_vars.items():
             try:
                 self.stacks[pos] = float(var.get())
@@ -881,7 +1095,8 @@ class PokerFullHUDApp:
         n = len(seats)
 
         for i, pos in enumerate(seats):
-            angle = math.pi / 2 - 2 * math.pi * i / n
+            # +2π·i/n: по часовой стрелке вокруг стола (вид сверху); минус давал обход против часовой.
+            angle = math.pi / 2 + 2 * math.pi * i / n
             if i == 0:
                 sx, sy = cx, cy + ry + 48
             else:
