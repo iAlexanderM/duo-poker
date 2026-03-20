@@ -1,8 +1,8 @@
 import tkinter as tk
 
-from hud import PokerFullHUDApp
+from .app import PokerFullHUDApp
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = PokerFullHUDApp(root)
+    PokerFullHUDApp(root)
     root.mainloop()
