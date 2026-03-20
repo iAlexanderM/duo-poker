@@ -82,6 +82,37 @@ class PhaseSetupMixin:
         else:
             self._stack_overrides = {}
 
+        if self._first_hand:
+            tk.Label(
+                self.wizard,
+                text="Анте (настройка первой раздачи в сессии; дальше те же правила каждую руку)",
+                bg=self.PANEL, fg=self.MUTED, font=("Arial", 10),
+            ).pack(pady=(6, 2))
+            af = tk.Frame(self.wizard, bg=self.PANEL)
+            af.pack(pady=(0, 4))
+            tk.Label(af, text="Анте, bb:", bg=self.PANEL, fg=self.MUTED,
+                     font=("Arial", 12, "bold")).pack(side="left", padx=(12, 6))
+            self._ante_s = tk.StringVar(
+                value=f"{float(getattr(self, 'ante_bb', 0) or 0):g}"
+            )
+            tk.Entry(af, textvariable=self._ante_s, width=6, bg="#302828",
+                     fg=self.TEXT, insertbackground=self.TEXT, relief="flat",
+                     font=("Arial", 12, "bold")).pack(side="left", padx=(0, 16))
+            self._ante_scope = tk.StringVar(
+                value="bb_only" if getattr(self, "ante_scope", "all") == "bb_only" else "all"
+            )
+            rf = tk.Frame(self.wizard, bg=self.PANEL)
+            rf.pack(pady=(0, 8))
+            tk.Label(rf, text="Платит анте:", bg=self.PANEL, fg=self.MUTED,
+                     font=("Arial", 12, "bold")).pack(side="left", padx=(12, 8))
+            for text, val in (("Со всех игроков", "all"), ("Только ББ", "bb_only")):
+                tk.Radiobutton(
+                    rf, text=text, variable=self._ante_scope, value=val,
+                    bg=self.PANEL, fg=self.TEXT, selectcolor="#302828",
+                    activebackground=self.PANEL, activeforeground=self.TEXT,
+                    font=("Arial", 11, "bold"),
+                ).pack(side="left", padx=6)
+
         btns_f = tk.Frame(self.wizard, bg=self.PANEL)
         btns_f.pack(pady=(4, 16))
         tk.Button(btns_f, text="Начать раздачу →", command=self._start_hand,
@@ -147,16 +178,20 @@ class PhaseSetupMixin:
         self.active_slot = ("hole", 0)
         self.pot = 0.0
 
-        if "SB" in self.positions:
-            a = min(0.5, self.stacks["SB"])
-            self.bets["SB"] = a
-            self.stacks["SB"] -= a
-        if "BB" in self.positions:
-            a = min(1.0, self.stacks["BB"])
-            self.bets["BB"] = a
-            self.stacks["BB"] -= a
-        self.max_bet = 1.0
-        self.pot = sum(self.bets.values())
+        if self._first_hand:
+            try:
+                ab = float(self._ante_s.get().replace(",", "."))
+            except (ValueError, AttributeError):
+                messagebox.showerror("Ошибка", "Неверный формат анте")
+                return
+            if ab < 0:
+                messagebox.showerror("Ошибка", "Анте не может быть отрицательным")
+                return
+            self.ante_bb = ab
+            sc = self._ante_scope.get()
+            self.ante_scope = sc if sc in ("all", "bb_only") else "all"
+
+        self._post_preflop_dead_money()
 
         self._show_cards("Выберите ваши карты", self._cards_done_pre)
 

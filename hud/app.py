@@ -50,6 +50,10 @@ class PokerFullHUDApp(
         self._saved_stacks: dict[str, float] = {}
         self._saved_nplayers = 8
         self._first_hand = True
+        self.ante_bb = 0.0
+        self.ante_scope = "all"
+        self._seat_ante_posted: dict[str, float] = {}
+        self._hand_pot_contributed: dict[str, float] = {}
         self.active: set[str] = set()
         self.folded: set[str] = set()
         self.pot = 0.0

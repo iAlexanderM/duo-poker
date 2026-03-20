@@ -18,6 +18,7 @@ class TableCanvasMixin:
         ch = max(c.winfo_height(), 400)
         c.delete("all")
         self.slot_rects = {}
+        self._seat_hit_rects = {}
 
         cx, cy = cw // 2, ch // 2 - 50
         rx = min(cw // 2 - 60, 370)
@@ -30,8 +31,23 @@ class TableCanvasMixin:
         c.create_oval(cx - rx + 26, cy - ry + 26, cx + rx - 26, cy + ry - 26,
                       fill=self.FELT_DEEP, outline="#347340", width=2)
 
-        c.create_text(cx, cy - 30, text=f"Банк: {self.pot:.1f} BB",
-                      fill="#e7d8a5", font=("Arial", 15, "bold"))
+        bank_rows = self._live_bank_labels()
+        if bank_rows:
+            nrows = len(bank_rows)
+            base_y = cy - 34 - 7 * max(0, nrows - 1)
+            for i, row in enumerate(bank_rows):
+                c.create_text(
+                    cx, base_y + i * 16, text=f"{row} bb",
+                    fill="#e7d8a5", font=("Arial", 12, "bold"),
+                )
+            c.create_text(
+                cx, base_y + nrows * 16 + 4,
+                text=f"Σ всего: {self.pot:.1f} bb",
+                fill="#a89878", font=("Arial", 10, "bold"),
+            )
+        else:
+            c.create_text(cx, cy - 30, text=f"Банк: {self.pot:.1f} BB",
+                          fill="#e7d8a5", font=("Arial", 15, "bold"))
 
         if not self.positions:
             return
@@ -62,6 +78,7 @@ class TableCanvasMixin:
             else:
                 fill, fg, ol = "#223328", self.TEXT, "#111"
 
+            self._seat_hit_rects[pos] = (sx - 40, sy - 20, sx + 40, sy + 20)
             c.create_oval(sx - 40, sy - 20, sx + 40, sy + 20,
                           fill=fill, outline=ol, width=2 if acting else 1)
             c.create_text(sx, sy - 5, text=pos, fill=fg,
@@ -72,10 +89,19 @@ class TableCanvasMixin:
                           font=("Arial", 9))
 
             bet = self.bets.get(pos, 0)
-            if bet > 0:
+            ante_here = float(
+                (getattr(self, "_seat_ante_posted", None) or {}).get(pos, 0) or 0
+            )
+            if bet > 0 or ante_here > 0:
                 bx = sx + (cx - sx) * 0.35
                 by = sy + (cy - sy) * 0.35
-                c.create_text(int(bx), int(by), text=f"{bet:.1f}",
+                if bet > 0 and ante_here > 0:
+                    chip_txt = f"{bet:.1f} ({ante_here:.1f})"
+                elif bet > 0:
+                    chip_txt = f"{bet:.1f}"
+                else:
+                    chip_txt = f"({ante_here:.1f})"
+                c.create_text(int(bx), int(by), text=chip_txt,
                               fill="#ddd", font=("Arial", 10, "bold"))
 
         # Board

@@ -8,6 +8,13 @@ class CanvasSlotsMixin:
     # ══════════════════════════════════════════════════════════════
 
     def _on_canvas_click(self, event):
+        if self.current_actor is not None:
+            rects = getattr(self, "_seat_hit_rects", None) or {}
+            for pos, (x1, y1, x2, y2) in rects.items():
+                if x1 <= event.x <= x2 and y1 <= event.y <= y2:
+                    self._fold_until_actor(pos)
+                    return
+
         for target, (x1, y1, x2, y2) in self.slot_rects.items():
             if x1 <= event.x <= x2 and y1 <= event.y <= y2:
                 self.active_slot = target

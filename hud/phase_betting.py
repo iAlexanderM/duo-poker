@@ -11,12 +11,32 @@ from hud.ordering import (
     _postflop_acting_order,
     _street_order,
 )
+from hud.preflop_dead import apply_preflop_dead
+from logic.side_pots import (
+    breakdown_matches_pot,
+    build_showdown_pots,
+    side_pot_lines_for_ui,
+)
 
 
 class PhaseBettingMixin:
     # ══════════════════════════════════════════════════════════════
     #  PHASE 3 — ACTION ROUND
     # ══════════════════════════════════════════════════════════════
+
+    def _post_preflop_dead_money(self):
+        self.pot, self.max_bet, ab = apply_preflop_dead(
+            self.positions,
+            self.stacks,
+            self.bets,
+            getattr(self, "ante_bb", 0.0),
+            getattr(self, "ante_scope", "all"),
+        )
+        self._seat_ante_posted = ab
+        self._hand_pot_contributed = {
+            p: round(float(ab.get(p, 0)) + float(self.bets.get(p, 0)), 4)
+            for p in self.positions
+        }
 
     def _begin_action_round(self):
         self._action_undo_stack.clear()
@@ -49,6 +69,25 @@ class PhaseBettingMixin:
                 out.append(pos)
         return deque(out)
 
+    def _fold_until_actor(self, target_pos: str):
+        """Сфолдить всех в очереди до target_pos (не включая); один шаг «Назад» откатывает пакет."""
+        if not self.action_queue or self.current_actor is None:
+            return
+        if target_pos not in self.action_queue:
+            return
+        if self.action_queue[0] == target_pos:
+            return
+
+        self._sync_live_stacks()
+        self._push_action_undo()
+
+        while self.action_queue and self.action_queue[0] != target_pos:
+            pos = self.action_queue.popleft()
+            self.folded.add(pos)
+            self.active.discard(pos)
+
+        self._next_actor()
+
     def _next_actor(self):
         while self.action_queue and self.action_queue[0] in self.folded:
             self.action_queue.popleft()
@@ -59,6 +98,14 @@ class PhaseBettingMixin:
 
         pos = self.action_queue[0]
         self.current_actor = pos
+
+        stack = max(0.0, self.stacks.get(pos, 0))
+        to_call = max(0.0, self.max_bet - self.bets.get(pos, 0))
+        # Олл-ин / 0 bb: не спрашивать ни у героя, ни «что сделал X» — авто чек или колл на 0.
+        # Не вызывать здесь _sync_live_stacks: старые Entry после олл-ина вернут стек из UI.
+        if stack <= 1e-6:
+            self._do(pos, "check" if to_call <= 0 else "call")
+            return
 
         if pos == self.my_pos:
             self._show_my_turn()
@@ -102,6 +149,14 @@ class PhaseBettingMixin:
             self.pot = float(self._live_pot.get())
         except ValueError:
             pass
+
+    def _refresh_live_stack_widgets(self):
+        """После изменения self.stacks/pot в коде — иначе Entry перезатрут модель при следующем sync."""
+        if hasattr(self, "_live_stacks"):
+            for p, var in self._live_stacks.items():
+                var.set(f"{self.stacks.get(p, 0):.1f}")
+        if hasattr(self, "_live_pot"):
+            self._live_pot.set(f"{self.pot:.1f}")
 
     # ── opponent turn ────────────────────────────────────────────
 
@@ -338,6 +393,8 @@ class PhaseBettingMixin:
             self.stacks[pos] -= amt
             self.bets[pos] = already + amt
             self.pot += amt
+            self._hand_pot_contributed[pos] = round(
+                self._hand_pot_contributed.get(pos, 0) + amt, 4)
 
         elif action == "raise":
             try:
@@ -348,6 +405,8 @@ class PhaseBettingMixin:
             self.stacks[pos] -= amt
             self.bets[pos] = already + amt
             self.pot += amt
+            self._hand_pot_contributed[pos] = round(
+                self._hand_pot_contributed.get(pos, 0) + amt, 4)
             if self.bets[pos] > self.max_bet:
                 self.max_bet = self.bets[pos]
                 self._reopen(pos)
@@ -357,10 +416,13 @@ class PhaseBettingMixin:
             self.stacks[pos] = 0
             self.bets[pos] = already + amt
             self.pot += amt
+            self._hand_pot_contributed[pos] = round(
+                self._hand_pot_contributed.get(pos, 0) + amt, 4)
             if self.bets[pos] > self.max_bet:
                 self.max_bet = self.bets[pos]
                 self._reopen(pos)
 
+        self._refresh_live_stack_widgets()
         self._next_actor()
 
     def _reopen(self, raiser: str):
@@ -429,6 +491,251 @@ class PhaseBettingMixin:
             self.stacks[winners[0]] = self.stacks.get(winners[0], 0) + dust
         self.pot = 0.0
         return pot_val, per
+
+    _SIDE_POT_TOL = 0.15
+
+    def _side_pot_tol_dynamic(self) -> float:
+        p = float(self.pot)
+        return max(2.0, 0.02 * p) if p > 1e-9 else 2.0
+
+    def _try_begin_side_pot_showdown(self) -> bool:
+        hc = getattr(self, "_hand_pot_contributed", None) or {}
+        pot_now = float(self.pot)
+        tol = self._side_pot_tol_dynamic()
+        alive = set(self.active)
+        if not breakdown_matches_pot(hc, alive, pot_now, tol):
+            return False
+
+        pots, uncalled = build_showdown_pots(hc, alive)
+        if not pots:
+            return False
+
+        self._begin_side_pot_showdown(pots, uncalled)
+        return True
+
+    def _live_bank_labels(self) -> list[str] | None:
+        """Подписи банков на столе (сайд-поты отдельно); None — показать один общий."""
+        if not self.positions or self.pot <= 1e-9:
+            return None
+        hc = getattr(self, "_hand_pot_contributed", None) or {}
+        alive = set(self.active)
+        if not breakdown_matches_pot(hc, alive, float(self.pot), self._side_pot_tol_dynamic()):
+            return None
+        numbered, unc = side_pot_lines_for_ui(hc, alive)
+        lines = [f"Банк {n}: {amt:.1f}" for n, amt, _ in numbered]
+        for p, a in sorted(unc.items()):
+            if a > 1e-9:
+                lines.append(f"↩ {p}: {a:.1f}")
+        return lines
+
+    def _begin_side_pot_showdown(
+        self,
+        pots: list[tuple[float, frozenset[str]]],
+        uncalled: dict[str, float],
+    ):
+        self._sd_summary_prefix = []
+        for p, a in sorted(uncalled.items(), key=lambda x: x[0]):
+            if a <= 1e-9:
+                continue
+            self.stacks[p] = self.stacks.get(p, 0) + a
+            self._sd_summary_prefix.append(f"Невызванные {a:.1f} bb → {p}")
+        uct = sum(uncalled.values())
+        self.pot = max(0.0, self.pot - uct)
+
+        self._sd_pots = pots
+        self._sd_idx = 0
+        self._sd_outcomes: list[tuple[int, float, list[str]]] = []
+        self._show_showdown_pot_step()
+
+    def _distribute_sidepot_amount(self, amt: float, winners: list[str]):
+        n = len(winners)
+        if n <= 0:
+            return
+        per = amt / n
+        for w in winners:
+            self.stacks[w] = self.stacks.get(w, 0) + per
+        dust = amt - per * n
+        if abs(dust) > 1e-9:
+            self.stacks[winners[0]] = self.stacks.get(winners[0], 0) + dust
+        self.pot = max(0.0, self.pot - amt)
+
+    def _show_showdown_pot_step(self):
+        self._clear_wizard()
+        self._draw_table()
+
+        if self._sd_idx >= len(self._sd_pots):
+            self._finalize_side_pot_showdown()
+            return
+
+        amt, elig = self._sd_pots[self._sd_idx]
+        ntot = len(self._sd_pots)
+        k = self._sd_idx + 1
+
+        f = tk.Frame(self.wizard, bg=self.PANEL)
+        f.pack(fill="x", pady=(16, 8))
+
+        for line in getattr(self, "_sd_summary_prefix", []):
+            tk.Label(
+                f, text=line, bg=self.PANEL, fg=self.MUTED,
+                font=("Arial", 11),
+            ).pack(anchor="w", padx=16, pady=(0, 2))
+
+        tk.Label(
+            f,
+            text=f"Шоудаун — банк {k} из {ntot}: {amt:.1f} bb",
+            bg=self.PANEL, fg=self.TEXT, font=("Arial", 20, "bold"),
+        ).pack(pady=(4, 4))
+        elig_l = sorted(elig, key=lambda p: PREFLOP_ORDER.index(p) if p in PREFLOP_ORDER else 99)
+        tk.Label(
+            f,
+            text="Претенденты: " + ", ".join(elig_l),
+            bg=self.PANEL, fg=self.MUTED, font=("Arial", 12, "bold"),
+        ).pack(pady=(0, 10))
+
+        wf = tk.Frame(f, bg=self.PANEL)
+        wf.pack(pady=(0, 8))
+        for pos in elig_l:
+            tk.Button(
+                wf, text=pos, width=9,
+                bg=self.ACCENT, fg="#111", relief="flat",
+                font=("Arial", 13, "bold"),
+                command=lambda p=pos: self._sidepot_pick_single(p),
+            ).pack(side="left", padx=4)
+
+        tk.Label(
+            f, text="Ничья за этот банк:",
+            bg=self.PANEL, fg=self.MUTED, font=("Arial", 11, "bold"),
+        ).pack(pady=(12, 4))
+        tk.Button(
+            f, text="Несколько победителей (чоп) →",
+            command=self._sidepot_open_chop,
+            bg="#45515d", fg="white", relief="flat",
+            font=("Arial", 12, "bold"), padx=16, pady=5,
+        ).pack(pady=(0, 8))
+
+    def _sidepot_pick_single(self, w: str):
+        idx = self._sd_idx
+        amt, elig = self._sd_pots[idx]
+        if w not in elig:
+            return
+        self._distribute_sidepot_amount(amt, [w])
+        self._sd_outcomes.append((idx + 1, amt, [w]))
+        self._sd_idx += 1
+        self._show_showdown_pot_step()
+
+    def _sidepot_open_chop(self):
+        idx = self._sd_idx
+        amt, elig = self._sd_pots[idx]
+        self._clear_wizard()
+        self._draw_table()
+
+        f = tk.Frame(self.wizard, bg=self.PANEL)
+        f.pack(fill="x", pady=(16, 8))
+        tk.Label(
+            f,
+            text=f"Чоп банка {idx + 1}  |  {amt:.1f} bb",
+            bg=self.PANEL, fg=self.TEXT, font=("Arial", 18, "bold"),
+        ).pack(pady=(0, 10))
+
+        self._sidepot_chop_vars = {}
+        for pos in sorted(elig, key=lambda p: PREFLOP_ORDER.index(p) if p in PREFLOP_ORDER else 99):
+            v = tk.IntVar(value=0)
+            self._sidepot_chop_vars[pos] = v
+            tk.Checkbutton(
+                f, text=pos, variable=v, onvalue=1, offvalue=0,
+                bg=self.PANEL, fg=self.TEXT, selectcolor="#302828",
+                activebackground=self.PANEL, activeforeground=self.TEXT,
+                font=("Arial", 14, "bold"), anchor="w",
+            ).pack(fill="x", padx=24, pady=3)
+
+        bf = tk.Frame(self.wizard, bg=self.PANEL)
+        bf.pack(pady=(14, 10))
+        tk.Button(
+            bf, text="Подтвердить",
+            command=self._sidepot_confirm_chop,
+            bg="#2f6f3a", fg="white", relief="flat",
+            font=("Arial", 13, "bold"), padx=20, pady=6,
+        ).pack(side="left", padx=4)
+        tk.Button(
+            bf, text="« Назад",
+            command=self._show_showdown_pot_step,
+            bg="#45515d", fg="white", relief="flat",
+            font=("Arial", 11, "bold"), padx=14, pady=4,
+        ).pack(side="left", padx=4)
+
+    def _sidepot_confirm_chop(self):
+        idx = self._sd_idx
+        amt, elig = self._sd_pots[idx]
+        if not hasattr(self, "_sidepot_chop_vars"):
+            return
+        chosen = [p for p, var in self._sidepot_chop_vars.items() if var.get()]
+        if not chosen:
+            messagebox.showwarning("Чоп", "Отметь хотя бы одного победителя")
+            return
+        if not all(p in elig for p in chosen):
+            messagebox.showerror("Чоп", "Можно только из претендентов этого банка")
+            return
+        self._sidepot_chop_vars = {}
+        self._distribute_sidepot_amount(amt, chosen)
+        self._sd_outcomes.append((idx + 1, amt, chosen))
+        self._sd_idx += 1
+        self._show_showdown_pot_step()
+
+    def _finalize_side_pot_showdown(self):
+        self._action_undo_stack.clear()
+        self.current_actor = None
+        if self.pot > self._side_pot_tol_dynamic():
+            messagebox.showwarning(
+                "Банк",
+                f"После разбивки осталось {self.pot:.2f} bb — проверь вклады вручную.",
+            )
+        self.pot = 0.0
+        self._saved_stacks = dict(self.stacks)
+        self._first_hand = False
+        self._seat_ante_posted = {}
+
+        self._clear_wizard()
+        self._draw_table()
+        f = tk.Frame(self.wizard, bg=self.PANEL)
+        f.pack(fill="x", pady=(16, 6))
+
+        tk.Label(
+            f, text="Раздача завершена (несколько банков)",
+            bg=self.PANEL, fg=self.ACCENT, font=("Arial", 17, "bold"),
+        ).pack(pady=(0, 8))
+
+        for line in getattr(self, "_sd_summary_prefix", []):
+            tk.Label(
+                f, text=line, bg=self.PANEL, fg=self.MUTED,
+                font=("Arial", 12), wraplength=900,
+            ).pack(anchor="w", padx=12, pady=1)
+
+        for num, amt, ws in self._sd_outcomes:
+            names = ", ".join(ws)
+            n = len(ws)
+            sh = f"{amt / n:.1f}" if n else "0"
+            tk.Label(
+                f,
+                text=(f"Банк {num}: {amt:.1f} bb → {names}  "
+                      f"({'поровну ~' + sh + ' bb' if n > 1 else 'весь банк'})"),
+                bg=self.PANEL, fg=self.TEXT, font=("Arial", 14, "bold"),
+                wraplength=920, justify="left", anchor="w",
+            ).pack(anchor="w", padx=12, pady=4)
+
+        bf = tk.Frame(self.wizard, bg=self.PANEL)
+        bf.pack(pady=(12, 14))
+        tk.Button(bf, text="▶ Продолжить игру", command=self._continue_game,
+                  bg="#2f6f3a", fg="white", relief="flat",
+                  font=("Arial", 14, "bold"), padx=30, pady=6
+                  ).pack(side="left", padx=4)
+        tk.Button(bf, text="Настройки раздачи", command=self._next_hand,
+                  bg="#8c5e2f", fg="white", relief="flat",
+                  font=("Arial", 11, "bold"), padx=14, pady=4
+                  ).pack(side="left", padx=4)
+        tk.Button(bf, text="Править стеки", command=self._manual_edit,
+                  bg="#45515d", fg="white", relief="flat",
+                  font=("Arial", 11, "bold"), padx=14, pady=4
+                  ).pack(side="left", padx=4)
 
     def _show_showdown_winner_picker(self):
         self._clear_wizard()
@@ -510,8 +817,21 @@ class PhaseBettingMixin:
             self._saved_stacks = dict(self.stacks)
             self._first_hand = False
 
+        if self.pot <= 1e-9:
+            self._seat_ante_posted = {}
+
         self._clear_wizard()
         self._draw_table()
+
+        if (
+            not distributed
+            and len(self.active) > 1
+            and winners is None
+            and winner is None
+            and self._try_begin_side_pot_showdown()
+        ):
+            return
+
         f = tk.Frame(self.wizard, bg=self.PANEL)
         f.pack(fill="x", pady=(16, 6))
 
@@ -540,8 +860,11 @@ class PhaseBettingMixin:
                      ).pack(pady=(0, 10))
         else:
             tk.Label(
-                f, text=f"Шоудаун  |  Банк: {self.pot:.1f} bb  |  Кто выиграл?",
-                bg=self.PANEL, fg=self.TEXT, font=("Arial", 18, "bold")
+                f,
+                text=(f"Шоудаун  |  Банк: {self.pot:.1f} bb  |  "
+                      "Один банк (вклады не сходятся — ручной режим)"),
+                bg=self.PANEL, fg=self.TEXT, font=("Arial", 18, "bold"),
+                wraplength=920,
             ).pack(pady=(0, 10))
             wf = tk.Frame(f, bg=self.PANEL)
             wf.pack(pady=(0, 8))
@@ -554,7 +877,7 @@ class PhaseBettingMixin:
                     command=lambda p=pos: self._hand_over(winner=p),
                 ).pack(side="left", padx=4)
             tk.Label(
-                f, text="Ничья / чоп:",
+                f, text="Ничья / чоп (весь банк):",
                 bg=self.PANEL, fg=self.MUTED, font=("Arial", 11, "bold")
             ).pack(pady=(10, 4))
             tk.Button(
@@ -564,7 +887,7 @@ class PhaseBettingMixin:
                 font=("Arial", 12, "bold"), padx=16, pady=5,
             ).pack(pady=(0, 6))
             tk.Label(
-                f, text="(Обычно — кнопка позиции; чоп — только при ничьей)",
+                f, text="Если были олл-ины разного размера — обычно включается разбивка банков.",
                 bg=self.PANEL, fg=self.MUTED, font=("Arial", 10),
             ).pack(pady=(0, 4))
 
@@ -583,7 +906,20 @@ class PhaseBettingMixin:
                   font=("Arial", 11, "bold"), padx=14, pady=4
                   ).pack(side="left", padx=4)
 
+    def _require_pot_distributed(self) -> bool:
+        """Шоудаун без выбора победителя оставляет pot > 0 — тогда нельзя начинать новую руку."""
+        if self.pot > 1e-9:
+            messagebox.showwarning(
+                "Банк не разобран",
+                "Сначала укажи победителя (кнопка позиции или «Несколько победителей»). "
+                "Пока в банке есть фишки, продолжить нельзя.",
+            )
+            return False
+        return True
+
     def _continue_game(self):
+        if not self._require_pot_distributed():
+            return
         self._action_undo_stack.clear()
         n = len(self.positions)
         old_seats = self._seat_order()
@@ -613,20 +949,13 @@ class PhaseBettingMixin:
         self.active_slot = ("hole", 0)
         self.pot = 0.0
 
-        if "SB" in self.positions:
-            a = min(0.5, self.stacks["SB"])
-            self.bets["SB"] = a
-            self.stacks["SB"] -= a
-        if "BB" in self.positions:
-            a = min(1.0, self.stacks["BB"])
-            self.bets["BB"] = a
-            self.stacks["BB"] -= a
-        self.max_bet = 1.0
-        self.pot = sum(self.bets.values())
+        self._post_preflop_dead_money()
 
         self._show_cards("Выберите ваши карты", self._cards_done_pre)
 
     def _next_hand(self):
+        if not self._require_pot_distributed():
+            return
         self._saved_stacks = dict(self.stacks)
         self._show_setup()
 
