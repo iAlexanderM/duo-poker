@@ -1,8 +1,11 @@
+import logging
 import tkinter as tk
 from collections import deque
 from tkinter import messagebox
 
-from logic.advisor import recommend_action
+_log = logging.getLogger(__name__)
+
+from logic.decision_engine import recommend_action
 from models.hand import Hand
 
 from hud.ordering import (
@@ -12,11 +15,7 @@ from hud.ordering import (
     _street_order,
 )
 from hud.preflop_dead import apply_preflop_dead
-from logic.side_pots import (
-    breakdown_matches_pot,
-    build_showdown_pots,
-    side_pot_lines_for_ui,
-)
+from logic.side_pots import breakdown_matches_pot, build_showdown_pots
 
 
 class PhaseBettingMixin:
@@ -256,14 +255,17 @@ class PhaseBettingMixin:
             board=board_cards, stage=self.stage, pot_size_bb=pot_bb,
         )
 
+        advice_text = self._format_advice(advice)
+
         f = tk.Frame(self.wizard, bg=self.PANEL)
         f.pack(fill="x", pady=(10, 4))
 
         tk.Label(f, text=f"Твой ход ({self.my_pos})", bg=self.PANEL,
                  fg=self.ACCENT, font=("Arial", 22, "bold")).pack(pady=(0, 6))
-        tk.Label(f, text=f"Рекомендация: {advice}",
+        tk.Label(f, text=f"Рекомендация: {advice_text}",
                  bg="#302424", fg="#f6e58f",
-                 font=("Arial", 18, "bold"), padx=20, pady=12
+                 font=("Arial", 18, "bold"), padx=20, pady=12,
+                 justify="center", wraplength=900
                  ).pack(pady=(0, 6))
         tk.Label(f, text=(f"Банк: {self.pot:.1f} bb  |  "
                           f"До колла: {to_call:.1f} bb  |  "
@@ -278,6 +280,30 @@ class PhaseBettingMixin:
         self._build_stacks_bar(self.wizard)
 
     # ── shared action buttons ────────────────────────────────────
+
+    def _format_advice(self, advice):
+        if hasattr(advice, "action"):
+            action = getattr(advice.action, "value", str(advice.action))
+            sizing = getattr(advice, "sizing_bb", None)
+
+            if action in ("bet", "raise", "value_bet", "semibluff") and sizing is not None:
+                if action == "bet":
+                    return f"Ставка {sizing:.1f} bb"
+                if action == "raise":
+                    return f"Рейз до {sizing:.1f} bb"
+                if action == "value_bet":
+                    return f"Велью-бет {sizing:.1f} bb"
+                return f"Полублеф {sizing:.1f} bb"
+            if action == "shove":
+                return "All-in"
+            return {
+                "fold": "Фолд",
+                "check": "Чек",
+                "call": "Колл",
+                "raise": "Рейз",
+            }.get(action, action)
+
+        return str(advice)
 
     def _action_buttons(self, parent, pos, to_call):
         stack = self.stacks.get(pos, 0)
@@ -322,11 +348,17 @@ class PhaseBettingMixin:
         self._slider_updating = False
 
         def _set_raise(val: float):
-            val = max(min(val, max_raise), min_raise)
-            self.raise_var.set(f"{val:.1f}")
+            val = round(max(min(float(val), max_raise), min_raise), 1)
             self._slider_updating = True
-            self._raise_slider.set(val)
-            self._slider_updating = False
+            try:
+                self._raise_slider.set(val)
+            finally:
+                self._slider_updating = False
+            self.raise_var.set(f"{val:.1f}")
+            # Tk.Scale с грубым шагом или отложенным -command мог перезаписать поле;
+            # after_idle фиксирует целевое значение (олл-ин, %, программный set).
+            v = val
+            self.root.after_idle(lambda v=v: self.raise_var.set(f"{v:.1f}"))
 
         def set_pct(pct):
             self._sync_live_stacks()
@@ -356,15 +388,17 @@ class PhaseBettingMixin:
                   ).pack(side="left", padx=4)
 
         def on_slider(val):
-            if not self._slider_updating:
-                self.raise_var.set(f"{float(val):.1f}")
+            if self._slider_updating:
+                return
+            x = round(max(min(float(val), max_raise), min_raise), 1)
+            self.raise_var.set(f"{x:.1f}")
 
         slider_from = float(max(min_raise, 0.1))
         slider_to = float(max(max_raise, slider_from + 0.1))
         # Tk.Scale на части сборок плохо масштабирует большой диапазон при малой длине — даём запас по длине.
         self._raise_slider = tk.Scale(
             row2, from_=slider_from, to=slider_to,
-            orient="horizontal", resolution=0.5,
+            orient="horizontal", resolution=0.1,
             command=on_slider,
             bg=self.PANEL, fg=self.TEXT, troughcolor="#302828",
             highlightthickness=0, sliderrelief="flat",
@@ -514,19 +548,14 @@ class PhaseBettingMixin:
         return True
 
     def _live_bank_labels(self) -> list[str] | None:
-        """Подписи банков на столе (сайд-поты отдельно); None — показать один общий."""
-        if not self.positions or self.pot <= 1e-9:
-            return None
-        hc = getattr(self, "_hand_pot_contributed", None) or {}
-        alive = set(self.active)
-        if not breakdown_matches_pot(hc, alive, float(self.pot), self._side_pot_tol_dynamic()):
-            return None
-        numbered, unc = side_pot_lines_for_ui(hc, alive)
-        lines = [f"Банк {n}: {amt:.1f}" for n, amt, _ in numbered]
-        for p, a in sorted(unc.items()):
-            if a > 1e-9:
-                lines.append(f"↩ {p}: {a:.1f}")
-        return lines
+        """Всегда один общий банк в центре стола.
+
+        Алгоритм нарезки (build_showdown_pots) строит «слои» по разным вкладам
+        (анте, блайнды, рейзы без олл-ина) — это не отдельные сайд-поты, а одна
+        раздача на всех активных. Многострочная нарезка только мешает; при шоудауне
+        с реальными сайд-потами разбор идёт через _try_begin_side_pot_showdown.
+        """
+        return None
 
     def _begin_side_pot_showdown(
         self,
@@ -551,6 +580,11 @@ class PhaseBettingMixin:
         n = len(winners)
         if n <= 0:
             return
+        _log.info(
+            "Showdown pot %.4f bb → %s",
+            amt,
+            ", ".join(winners),
+        )
         per = amt / n
         for w in winners:
             self.stacks[w] = self.stacks.get(w, 0) + per
@@ -570,6 +604,7 @@ class PhaseBettingMixin:
         amt, elig = self._sd_pots[self._sd_idx]
         ntot = len(self._sd_pots)
         k = self._sd_idx + 1
+        order_hint = " · сначала сайд-поты, в конце main" if ntot > 1 else ""
 
         f = tk.Frame(self.wizard, bg=self.PANEL)
         f.pack(fill="x", pady=(16, 8))
@@ -582,7 +617,7 @@ class PhaseBettingMixin:
 
         tk.Label(
             f,
-            text=f"Шоудаун — банк {k} из {ntot}: {amt:.1f} bb",
+            text=f"Шоудаун — банк {k} из {ntot}: {amt:.1f} bb{order_hint}",
             bg=self.PANEL, fg=self.TEXT, font=("Arial", 20, "bold"),
         ).pack(pady=(4, 4))
         elig_l = sorted(elig, key=lambda p: PREFLOP_ORDER.index(p) if p in PREFLOP_ORDER else 99)

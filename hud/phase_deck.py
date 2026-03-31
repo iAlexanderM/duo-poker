@@ -58,7 +58,7 @@ class PhaseDeckMixin:
             parts.append(f"Борд: {' '.join(b)}")
         t, i = self.active_slot
         parts.append(f"[{'Карта' if t == 'hole' else 'Борд'} {i + 1}]")
-        if hasattr(self, "_cards_lbl"):
+        if getattr(self, "_cards_lbl", None) and self._cards_lbl.winfo_exists():
             self._cards_lbl.config(text="  ".join(parts))
 
     def _cards_done_pre(self):

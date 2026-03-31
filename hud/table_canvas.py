@@ -84,7 +84,7 @@ class TableCanvasMixin:
             c.create_text(sx, sy - 5, text=pos, fill=fg,
                           font=("Arial", 11, "bold"))
             c.create_text(sx, sy + 11,
-                          text=f"{self.stacks.get(pos, 0):.0f} bb",
+                          text=f"{self.stacks.get(pos, 0):.1f} bb",
                           fill=fg if not dead else "#555",
                           font=("Arial", 9))
 

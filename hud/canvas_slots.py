@@ -84,6 +84,8 @@ class CanvasSlotsMixin:
         sel = ({str(c) for c in self.hole if c} |
                {str(self.board[i]) for i in range(5) if self.board[i]})
         for code, btn in self.deck_btns.items():
+            if not btn.winfo_exists():
+                continue
             btn.config(bg="#ffeb3b" if code in sel else "white",
                        relief="sunken" if code in sel else "raised")
 
