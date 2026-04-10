@@ -178,6 +178,14 @@ class PhaseSetupMixin:
         self.active_slot = ("hole", 0)
         self.pot = 0.0
 
+        # Сброс переменных вкладов и сайд-потов от предыдущей раздачи
+        self._hand_pot_contributed = {}
+        self._seat_ante_posted = {}
+        self._sd_pots = []
+        self._sd_idx = 0
+        self._sd_outcomes = []
+        self._sd_summary_prefix = []
+
         if self._first_hand:
             try:
                 ab = float(self._ante_s.get().replace(",", "."))

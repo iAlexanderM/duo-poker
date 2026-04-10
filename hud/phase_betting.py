@@ -247,12 +247,32 @@ class PhaseBettingMixin:
         hand = Hand(self.hole[0], self.hole[1])
         pot_bb = self.pot if self.stage != "preflop" else None
 
+        # Считаем количество коллеров до нас (игроки с бетом = max_bet, но не мы и не активный беттор)
+        num_callers = 0
+        if to_call > 0:
+            for pos in self.active:
+                if pos != self.my_pos and pos != self.current_actor:
+                    if self.bets.get(pos, 0) >= self.max_bet - 0.01:
+                        num_callers += 1
+
+        # Считаем количество рейзеров (игроки, сделавшие рейз, а не просто колл)
+        num_raisers = 0
+        if self.stage == "preflop" and to_call > 0:
+            # На префлопе: рейзер = тот, кто поставил больше блайндов
+            for pos in self.active:
+                if pos != self.my_pos:
+                    if self.bets.get(pos, 0) > 1.0:  # Больше чем ББ
+                        num_raisers += 1
+            num_raisers = min(num_raisers, 3)  # Кап на 3
+
         advice = recommend_action(
             hand=hand, position=self.my_pos,
             stack=self.stacks[self.my_pos],
             opponent_action=oa, bet_to_call=btc,
             num_players=len(self.active),
             board=board_cards, stage=self.stage, pot_size_bb=pot_bb,
+            num_callers=num_callers,
+            num_raisers=num_raisers,
         )
 
         advice_text = self._format_advice(advice)
@@ -727,7 +747,9 @@ class PhaseBettingMixin:
         self.pot = 0.0
         self._saved_stacks = dict(self.stacks)
         self._first_hand = False
+        # Сброс переменных раунда для следующей раздачи
         self._seat_ante_posted = {}
+        self._hand_pot_contributed = {}
 
         self._clear_wizard()
         self._draw_table()
@@ -852,8 +874,10 @@ class PhaseBettingMixin:
             self._saved_stacks = dict(self.stacks)
             self._first_hand = False
 
+        # Сброс переменных раунда для следующей раздачи
         if self.pot <= 1e-9:
             self._seat_ante_posted = {}
+            self._hand_pot_contributed = {}
 
         self._clear_wizard()
         self._draw_table()
@@ -983,6 +1007,14 @@ class PhaseBettingMixin:
         self.hole = [None, None]
         self.active_slot = ("hole", 0)
         self.pot = 0.0
+
+        # Сброс переменных вкладов и сайд-потов от предыдущей раздачи
+        self._hand_pot_contributed = {}
+        self._seat_ante_posted = {}
+        self._sd_pots = []
+        self._sd_idx = 0
+        self._sd_outcomes = []
+        self._sd_summary_prefix = []
 
         self._post_preflop_dead_money()
 

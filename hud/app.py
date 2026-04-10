@@ -54,6 +54,10 @@ class PokerFullHUDApp(
         self.ante_scope = "all"
         self._seat_ante_posted: dict[str, float] = {}
         self._hand_pot_contributed: dict[str, float] = {}
+        self._sd_pots: list = []
+        self._sd_idx = 0
+        self._sd_outcomes: list = []
+        self._sd_summary_prefix: list = []
         self.active: set[str] = set()
         self.folded: set[str] = set()
         self.pot = 0.0
